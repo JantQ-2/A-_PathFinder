@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "id": "asharp_pathfinding",
+  "version": "1.0.0",
+  "name": "A# Pathfinding",
+  "description": "Advanced A* pathfinding system with public API for Minecraft mods.",
+  "authors": [
+    "QuiteBoring",
+    "Twiston",
+    "oblongboot",
+    "JantQ"
+  ],
+  "contact": {
+    "homepage": "https://cobalt.quiteboring.dev/",
+    "sources": "https://github.com/CobaltScripts/Cobalt"
+  },
+  "license": "CC0-1.0",
+  "icon": "assets/asharp_pathfinding/icon.png",
+  "environment": "*",
+  "entrypoints": {
+    "cobalt": [
+      {
+        "adapter": "kotlin",
+        "value": "jant.path.PathfinderAddon"
+      }
+    ]
+  },
+  "mixins": [
+    "asharp_pathfinding.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=${loader_version}",
+    "fabric-api": "*",
+    "minecraft": "~${minecraft_version}",
+    "java": ">=21",
+    "fabric-language-kotlin": ">=${fabric_kotlin_version}"
+  }
+}

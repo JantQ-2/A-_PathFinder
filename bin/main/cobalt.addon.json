@@ -1,0 +1,11 @@
+{
+  "id": "asharp_pathfinding",
+  "name": "A# Pathfinding",
+  "version": "1.0.0",
+  "entrypoints": [
+    "jant.path.PathfinderAddon"
+  ],
+  "mixins": [
+    "asharp_pathfinding.mixins.json"
+  ]
+}
