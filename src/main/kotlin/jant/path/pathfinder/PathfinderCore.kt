@@ -19,7 +19,8 @@ import kotlin.math.sqrt
 
 object PathfinderCore : IPathExec {
 
-    private const val STUCK_THRESHOLD = 60
+    private const val STUCK_THRESHOLD = 100
+    private const val STUCK_AREA_RADIUS = 2
     private const val MAX_ITERATIONS = 50000
     private const val RECALC_COOLDOWN = 1000L 
     private const val MAX_FALL_DISTANCE = 60
@@ -53,7 +54,10 @@ object PathfinderCore : IPathExec {
     /** Last recorded player position for stuck detection */
     private var lastPlayerPos: BlockPos? = null
     
-    /** Counter for how many ticks the player hasn't moved */
+    /** Initial position when player entered current area for stuck detection */
+    private var stuckAreaOrigin: BlockPos? = null
+    
+    /** Counter for how many ticks the player has been in the same area */
     private var stuckTicks = 0
     
     /** Whether sneak should remain active (e.g., at edges) */
@@ -96,12 +100,12 @@ object PathfinderCore : IPathExec {
 
     /**
      * Calculates maximum vertical jump height based on Jump Boost effect.
-     * @return Number of blocks the player can jump (1 + jump boost level)
+     * @return Number of blocks the player can jump (1 + jump boost level, capped at 3)
      */
     private fun getMaxJumpHeight(player: ClientPlayerEntity): Int {
         val jumpBoost = getJumpBoostLevel(player)
 
-        return 1 + jumpBoost
+        return (1 + jumpBoost).coerceAtMost(3)
     }
 
     /**
@@ -177,12 +181,24 @@ object PathfinderCore : IPathExec {
         val currentTime = System.currentTimeMillis()
         val playerPos = BlockPos.ofFloored(player.x, player.y, player.z)
 
-        if (playerPos == lastPlayerPos) {
-            stuckTicks++
-        } else {
+        // Check if player is within 5x5 area (2 blocks radius) of origin
+        val origin = stuckAreaOrigin
+        if (origin == null) {
+            stuckAreaOrigin = playerPos
             stuckTicks = 0
-            lastPlayerPos = playerPos
+        } else {
+            val isInArea = kotlin.math.abs(playerPos.x - origin.x) <= STUCK_AREA_RADIUS &&
+                          kotlin.math.abs(playerPos.z - origin.z) <= STUCK_AREA_RADIUS
+            
+            if (isInArea) {
+                stuckTicks++
+            } else {
+                stuckAreaOrigin = playerPos
+                stuckTicks = 0
+            }
         }
+        
+        lastPlayerPos = playerPos
 
         val shouldRecalculate = stuckTicks > STUCK_THRESHOLD
 
@@ -194,6 +210,7 @@ object PathfinderCore : IPathExec {
             currentIndex = 0
             lastRecalcTime = currentTime
             stuckTicks = 0
+            stuckAreaOrigin = playerPos
 
             if (currentPath == null) {
                 if (DEBUG) println("[Pathfinder] No path found to target")
@@ -650,6 +667,11 @@ object PathfinderCore : IPathExec {
                 } else {
                     break
                 }
+            }
+
+            // 8 snow layers = full block, treat as solid ground
+            if (snowDepth >= 8) {
+                return true
             }
 
             if (snowDepth > 2) {
