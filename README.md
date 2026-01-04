@@ -45,7 +45,7 @@ override fun onWorldRenderLast(ctx: WorldRenderContext, player: ClientPlayerEnti
 }
 ```
 
-## ⚙️ Customization Guide
+## Customization Guide
 
 ### 1. Adjusting Path Behavior
 
@@ -132,7 +132,7 @@ private fun getMaxJumpDistance(player: ClientPlayerEntity): Int {
 private const val MAX_FALL_DISTANCE = 100    // Default: 60
 ```
 
-## 🎨 Visualization Customization
+## Visualization Customization
 
 ### Change waypoint colors:
 ```kotlin
@@ -157,7 +157,7 @@ val box = Box(
 Render3D.drawLine(ctx, start, end, lineColor, esp = true, thickness = 5f)  // Default: 3f
 ```
 
-## 🧪 Adding Custom Movement Patterns
+## Adding Custom Movement Patterns
 
 ### Example: Add 4-block jumps
 ```kotlin
@@ -181,7 +181,7 @@ val canSwim = blockState.block == Blocks.WATER && player.hasEffect(StatusEffects
 return (hasSolidGround || canSwim) && canWalkThroughFeet && canWalkThroughHead && !isDangerous
 ```
 
-## 🐛 Debugging
+## Debugging
 
 ### Enable debug output:
 ```kotlin
@@ -202,7 +202,7 @@ println("Current index: $currentIndex")
 println("Distance to goal: ${player.blockPos.getManhattanDistance(targetPos)}")
 ```
 
-## 📊 Algorithm Overview
+## Algorithm Overview
 
 ### A* Pathfinding
 1. **Open Set**: Positions to explore (priority queue by fCost)
@@ -226,7 +226,7 @@ println("Distance to goal: ${player.blockPos.getManhattanDistance(targetPos)}")
 - **Wall Avoidance**: Prefers open spaces over tight corridors
 - **Stuck Detection**: Auto-recalculates if no progress
 
-## 🔧 Common Issues
+## Common Issues
 
 ### Bot gets stuck in corners
 - Increase `DIAGONAL_TURN_COST`
@@ -249,7 +249,7 @@ println("Distance to goal: ${player.blockPos.getManhattanDistance(targetPos)}")
 - Increase `RECALC_COOLDOWN`
 - Reduce `MAX_FALL_DISTANCE`
 
-## 🤝 Contributing
+## Contributing
 
 When modifying the pathfinder:
 1. Test in various terrain types (plains, caves, buildings)
@@ -258,6 +258,6 @@ When modifying the pathfinder:
 4. Check performance with long paths (>100 blocks)
 5. Update documentation for significant changes
 
-## 📄 License
+## License
 
 Part of the Cobalt Example Addon - see LICENSE file in project root.

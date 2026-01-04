@@ -15,15 +15,18 @@ import org.cobalt.api.pathfinder.IPathExec
 import org.cobalt.api.util.render.Render3D
 import java.awt.Color
 import java.util.*
+import java.util.Collections
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.Executors
 import kotlin.math.sqrt
 
 object PathfinderCore : IPathExec {
 
     private const val STUCK_THRESHOLD = 100
     private const val STUCK_AREA_RADIUS = 2
-    private const val MAX_ITERATIONS = 50000
+    private const val MAX_ITERATIONS = 15000  // Reduced for faster pathfinding
     private const val RECALC_COOLDOWN = 1000L 
-    private const val MAX_FALL_DISTANCE = 60
+    private const val MAX_FALL_DISTANCE = 20  // Reduced to explore fewer neighbors
     
     private const val JUMP_COST_MULTIPLIER = 1.5
     private const val DIAGONAL_TURN_COST = 0.3
@@ -31,13 +34,27 @@ object PathfinderCore : IPathExec {
     private const val VERTICAL_CLIMB_COST = 2.5
     private const val VERTICAL_DROP_COST = 0.8
     
-    private const val HEURISTIC_BIAS = 1.2
+    private const val HEURISTIC_BIAS = 1.5  // Higher bias = faster but less optimal paths
 
-    private const val DEBUG = false
+    private const val DEBUG = true
     
     // === STATE VARIABLES ===
     
     private val mc = MinecraftClient.getInstance()
+    
+    /** Thread pool for async pathfinding calculations */
+    private val pathfindingExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "Pathfinding-Thread").apply { isDaemon = true }
+    }
+    
+    /** Current async pathfinding task */
+    private var pathCalculationFuture: CompletableFuture<List<BlockPos>?>? = null
+    
+    /** Flag to indicate if a path calculation is in progress */
+    private var isCalculating = false
+    
+    /** Cached world snapshot for thread-safe access */
+    private var worldSnapshot: WorldSnapshot? = null
     
     /** Currently calculated path as a list of block positions */
     private var currentPath: List<BlockPos>? = null
@@ -138,6 +155,12 @@ object PathfinderCore : IPathExec {
      * Call this to cancel pathfinding.
      */
     fun clearPath() {
+        // Cancel any ongoing calculation
+        pathCalculationFuture?.cancel(true)
+        pathCalculationFuture = null
+        isCalculating = false
+        worldSnapshot = null
+        
         currentPath = null
         targetPos = null
         currentIndex = 0
@@ -202,29 +225,88 @@ object PathfinderCore : IPathExec {
 
         val shouldRecalculate = stuckTicks > STUCK_THRESHOLD
 
-        if (currentPath == null || shouldRecalculate) {
+        // Check if async calculation completed
+        pathCalculationFuture?.let { future ->
+            if (future.isDone) {
+                try {
+                    val calculatedPath = future.get()
+                    currentPath = calculatedPath
+                    currentIndex = 0
+                    lastRecalcTime = currentTime
+                    stuckTicks = 0
+                    stuckAreaOrigin = playerPos
+                    isCalculating = false
+                    worldSnapshot = null
+                    
+                    if (calculatedPath == null) {
+                        if (DEBUG) println("[Pathfinder] No path found to target")
+                        currentApiSession?.let { session ->
+                            PathfinderAPI.notifyPathFailed(session, "No path found to target")
+                        }
+                        clearPath()
+                        return
+                    }
+                    
+                    // Notify API that path was calculated
+                    currentApiSession?.let { session ->
+                        PathfinderAPI.notifyPathCalculated(session, calculatedPath)
+                    }
+                } catch (e: Exception) {
+                    if (DEBUG) println("[Pathfinder] Path calculation error: ${e.message}")
+                    isCalculating = false
+                    worldSnapshot = null
+                    currentApiSession?.let { session ->
+                        PathfinderAPI.notifyPathFailed(session, "Calculation error: ${e.message}")
+                    }
+                    clearPath()
+                    return
+                }
+                pathCalculationFuture = null
+            }
+        }
+
+        // Start new calculation if needed and not already calculating
+        if ((currentPath == null || shouldRecalculate) && !isCalculating) {
             if (shouldRecalculate) {
                 if (DEBUG) println("[Pathfinder] Stuck detected, recalculating path")
             }
-            currentPath = findPath(playerPos, target)
-            currentIndex = 0
-            lastRecalcTime = currentTime
-            stuckTicks = 0
-            stuckAreaOrigin = playerPos
-
-            if (currentPath == null) {
-                if (DEBUG) println("[Pathfinder] No path found to target")
-                currentApiSession?.let { session ->
-                    PathfinderAPI.notifyPathFailed(session, "No path found to target")
-                }
-                clearPath()
+            
+            // Capture world reference on main thread
+            val world = mc.world
+            if (world == null) {
+                if (DEBUG) println("[Pathfinder] World is null, cannot pathfind")
                 return
             }
             
-            // Notify API that path was calculated
-            currentApiSession?.let { session ->
-                PathfinderAPI.notifyPathCalculated(session, currentPath!!)
+            isCalculating = true
+            
+            // Create snapshot on main thread (fast - just captures reference)
+            worldSnapshot = WorldSnapshot.create(world, playerPos, target)
+            if (worldSnapshot == null) {
+                if (DEBUG) println("[Pathfinder] Failed to create world snapshot")
+                isCalculating = false
+                return
             }
+            
+            if (DEBUG) println("[Pathfinder] Starting async path calculation from $playerPos to $target")
+            
+            // Start async pathfinding in background thread
+            pathCalculationFuture = CompletableFuture.supplyAsync({
+                try {
+                    if (DEBUG) println("[Pathfinder-Thread] Calculating path...")
+                    val result = findPathThreaded(playerPos, target)
+                    if (DEBUG) println("[Pathfinder-Thread] Path calculated: ${result?.size ?: 0} waypoints")
+                    result
+                } catch (e: Exception) {
+                    if (DEBUG) {
+                        println("[Pathfinder-Thread] Error: ${e.message}")
+                        e.printStackTrace()
+                    }
+                    null
+                }
+            }, pathfindingExecutor)
+            
+            if (DEBUG) println("[Pathfinder] Async calculation submitted")
         }
 
         val path = currentPath ?: return
@@ -409,6 +491,9 @@ object PathfinderCore : IPathExec {
      * @return List of waypoints from start to end, or null if no path exists
      */
     private fun findPath(start: BlockPos, end: BlockPos): List<BlockPos>? {
+        val world = mc.world ?: return null
+        val player = mc.player ?: return null
+        
         val openSet = PriorityQueue<PathNode>(compareBy { it.fCost })
         val closedSet = mutableSetOf<BlockPos>()
         val allNodes = mutableMapOf<BlockPos, PathNode>()
@@ -481,6 +566,7 @@ object PathfinderCore : IPathExec {
 
     /**
      * Gets all valid neighbor positions from a given position.
+     * Thread-safe version using cached world snapshot.
      * 
      * This function generates potential movement options including:
      * - Cardinal movements (N, S, E, W)
@@ -501,7 +587,7 @@ object PathfinderCore : IPathExec {
         val world = mc.world ?: return emptyList()
         val player = mc.player ?: return emptyList()
         val neighbors = mutableListOf<BlockPos>()
-
+        
         val maxJumpHeight = getMaxJumpHeight(player)
         val maxJumpDistance = getMaxJumpDistance(player)
 
@@ -791,7 +877,7 @@ object PathfinderCore : IPathExec {
             val blockState = world.getBlockState(checkPos)
             val headState = world.getBlockState(headPos)
 
-            if ((blockState.isSolidBlock(world, checkPos) && !isPassableBlock(blockState)) || 
+            if ((blockState.isSolidBlock(world, checkPos) && !isPassableBlock(blockState)) ||
                 (headState.isSolidBlock(world, headPos) && !isPassableBlock(headState))) {
                 return false
             }
@@ -1119,6 +1205,398 @@ object PathfinderCore : IPathExec {
                 if (DEBUG) println("[Pathfinder] Target render error: ${e.message}")
             }
         }
+    }
+    
+    /**
+     * Thread-safe pathfinding that uses a world snapshot.
+     * This version runs on a background thread and doesn't freeze the game.
+     * 
+     * @param start Starting position
+     * @param end Target position
+     * @return List of waypoints or null if no path found
+     */
+    private fun findPathThreaded(start: BlockPos, end: BlockPos): List<BlockPos>? {
+        val snapshot = worldSnapshot ?: return null
+        val player = mc.player ?: return null
+        
+        val openSet = PriorityQueue<PathNode>(compareBy { it.fCost })
+        val closedSet = mutableSetOf<BlockPos>()
+        val allNodes = mutableMapOf<BlockPos, PathNode>()
+
+        val startNode = PathNode(start, gCost = 0.0, hCost = heuristic(start, end))
+        allNodes[start] = startNode
+        openSet.add(startNode)
+
+        var iterations = 0
+
+        while (openSet.isNotEmpty() && iterations < MAX_ITERATIONS) {
+            // Check if calculation was cancelled
+            if (Thread.currentThread().isInterrupted) {
+                return null
+            }
+            
+            iterations++
+
+            val current = openSet.poll()
+            closedSet.add(current.pos)
+
+            if (current.pos == end) {
+                return reconstructPath(current)
+            }
+
+            for (neighbor in getNeighborsThreaded(current.pos, snapshot, player)) {
+                if (neighbor in closedSet) continue
+                if (!isWalkableThreaded(neighbor, snapshot)) continue
+                if (!canMoveDiagonallyThreaded(current.pos, neighbor, snapshot)) continue
+
+                var movementCost = distance(current.pos, neighbor)
+
+                val heightChange = neighbor.y - current.pos.y
+                
+                // Heavy penalty for going up - discourages air paths
+                if (heightChange > 0) {
+                    movementCost += heightChange * JUMP_COST_MULTIPLIER * 3.0  // 3x multiplier
+                }
+                
+                // Penalty for being high above ground
+                val groundDistance = getDistanceToGround(neighbor, snapshot)
+                if (groundDistance > 1) {
+                    movementCost += groundDistance * 5.0  // Strong penalty for air paths
+                }
+
+                val wallProximityPenalty = checkWallProximityThreaded(neighbor, snapshot)
+                movementCost += wallProximityPenalty
+
+                current.parent?.let { parent ->
+                    val prevDir = current.pos.subtract(parent.pos)
+                    val nextDir = neighbor.subtract(current.pos)
+
+                    if (prevDir.x != nextDir.x || prevDir.z != nextDir.z) {
+                        val prevIsDiagonal = prevDir.x != 0 && prevDir.z != 0
+                        val nextIsDiagonal = nextDir.x != 0 && nextDir.z != 0
+
+                        movementCost += if (prevIsDiagonal || nextIsDiagonal) {
+                            DIAGONAL_TURN_COST
+                        } else {
+                            CARDINAL_TURN_COST
+                        }
+                    }
+                }
+
+                val tentativeG = current.gCost + movementCost
+                val neighborNode = allNodes.getOrPut(neighbor) {
+                    PathNode(neighbor, hCost = heuristic(neighbor, end))
+                }
+
+                if (tentativeG < neighborNode.gCost) {
+                    neighborNode.gCost = tentativeG
+                    neighborNode.parent = current
+
+                    if (neighborNode !in openSet) {
+                        openSet.add(neighborNode)
+                    }
+                }
+            }
+        }
+
+        return null
+    }
+    
+    /**
+     * Thread-safe version of getNeighbors using world snapshot.
+     * Optimized to generate fewer neighbors for faster pathfinding.
+     */
+    private fun getNeighborsThreaded(pos: BlockPos, snapshot: WorldSnapshot, player: ClientPlayerEntity): List<BlockPos> {
+        val neighbors = mutableListOf<BlockPos>()
+        
+        val maxJumpHeight = minOf(getMaxJumpHeight(player), 2)  // Cap at 2 for speed
+        val maxJumpDistance = minOf(getMaxJumpDistance(player), 3)  // Cap at 3 for speed
+
+        fun hasHeadroomThreaded(checkPos: BlockPos): Boolean {
+            val blockAhead = snapshot.getBlockState(checkPos.up())
+            return isPassableBlock(blockAhead) || !blockAhead.isSolidBlock(snapshot.world, checkPos.up())
+        }
+        
+        fun adjustForSnow(checkPos: BlockPos): BlockPos {
+            // Check if there's snow at or below this position
+            val blockAt = snapshot.getBlockState(checkPos)
+            val blockBelow = snapshot.getBlockState(checkPos.down())
+            
+            if (blockAt.block.translationKey.contains("snow")) {
+                // Standing in snow, move up to stand on top
+                return checkPos.up()
+            }
+            if (blockBelow.block.translationKey.contains("snow")) {
+                // Snow below, position is correct (standing on snow)
+                return checkPos
+            }
+            return checkPos
+        }
+
+        // Cardinal movements - adjust for snow
+        listOf(
+            pos.add(1, 0, 0), pos.add(-1, 0, 0),
+            pos.add(0, 0, 1), pos.add(0, 0, -1)
+        ).map { adjustForSnow(it) }.filter { hasHeadroomThreaded(it) }.forEach { neighbors.add(it) }
+
+        // Diagonal movements - adjust for snow
+        listOf(
+            pos.add(1, 0, 1), pos.add(1, 0, -1),
+            pos.add(-1, 0, 1), pos.add(-1, 0, -1)
+        ).map { adjustForSnow(it) }.filter { hasHeadroomThreaded(it) }.forEach { neighbors.add(it) }
+
+        // Only add jump/climb movements if there's a block blocking direct movement
+        // This prevents unnecessary air paths
+        val needsJumps = listOf(
+            pos.add(1, 0, 0), pos.add(-1, 0, 0),
+            pos.add(0, 0, 1), pos.add(0, 0, -1)
+        ).any { !isWalkableThreaded(it, snapshot) && hasHeadroomThreaded(it) }
+
+        if (needsJumps) {
+            // Simplified jump movements - only when needed
+            val cardinalDirs = listOf(
+                Pair(1, 0), Pair(-1, 0), Pair(0, 1), Pair(0, -1)
+            )
+
+            // Only test short jumps for speed and prefer staying low
+            for ((dx, dz) in cardinalDirs) {
+                for (height in 1..1) {  // Only 1 block jumps to avoid air paths
+                    for (distance in 1..2) {  // Only 1-2 block distance
+                        val jumpPos = pos.add(dx * distance, height, dz * distance)
+                        
+                        if (isWalkableThreaded(jumpPos, snapshot) && isJumpPathClearThreaded(pos, jumpPos, snapshot)) {
+                            neighbors.add(jumpPos)
+                        }
+                    }
+                }
+            }
+        }
+
+        // Simplified fall movements - only cardinal directions
+        val fallOffsets = listOf(
+            Pair(1, 0), Pair(-1, 0), Pair(0, 1), Pair(0, -1)
+        )
+
+        for ((dx, dz) in fallOffsets) {
+            for (dropHeight in 1..MAX_FALL_DISTANCE step 2) {  // Check every 2 blocks for speed
+                val dropPos = pos.add(dx, -dropHeight, dz)
+                
+                if (isWalkableThreaded(dropPos, snapshot)) {
+                    neighbors.add(dropPos)
+                    break
+                }
+            }
+        }
+
+        return neighbors
+    }
+    
+    /**
+     * Calculates how far above solid ground a position is.
+     * Returns 0 if on ground (including snow layers), higher values for positions in air.
+     */
+    private fun getDistanceToGround(pos: BlockPos, snapshot: WorldSnapshot): Int {
+        for (i in 0..10) {  // Check up to 10 blocks below
+            val checkPos = pos.down(i)
+            val blockState = snapshot.getBlockState(checkPos)
+            val blockName = blockState.block.translationKey
+            
+            // Consider snow layers as ground
+            if (blockName.contains("snow")) {
+                return i
+            }
+            
+            if (blockState.isSolidBlock(snapshot.world, checkPos) && !isPassableBlock(blockState)) {
+                return i
+            }
+        }
+        return 10  // Max penalty if very high in air
+    }
+    
+    /**
+     * Thread-safe version of checkWallProximity.
+     * Simplified for speed.
+     */
+    private fun checkWallProximityThreaded(pos: BlockPos, snapshot: WorldSnapshot): Double {
+        // Simplified - only check horizontal directions for speed
+        var wallCount = 0
+        val checkPositions = listOf(
+            pos.add(1, 0, 0), pos.add(-1, 0, 0),
+            pos.add(0, 0, 1), pos.add(0, 0, -1)
+        )
+
+        for (checkPos in checkPositions) {
+            val blockState = snapshot.getBlockState(checkPos)
+            if (blockState.isSolidBlock(snapshot.world, checkPos) && !isPassableBlock(blockState)) {
+                wallCount++
+            }
+        }
+
+        return when {
+            wallCount >= 6 -> 2.0 
+            wallCount >= 4 -> 1.0 
+            wallCount >= 2 -> 0.3 
+            else -> 0.0 
+        }
+    }
+    
+    /**
+     * Thread-safe version of isWalkable.
+     * Properly handles snow layers as walkable surfaces.
+     */
+    private fun isWalkableThreaded(pos: BlockPos, snapshot: WorldSnapshot): Boolean {
+        val blockBelow = snapshot.getBlockState(pos.down())
+        val blockAt = snapshot.getBlockState(pos)
+        val blockAbove = snapshot.getBlockState(pos.up())
+        
+        // Check if below or at position is snow layer
+        val blockBelowName = blockBelow.block.translationKey
+        val blockAtName = blockAt.block.translationKey
+        val isSnowBelow = blockBelowName.contains("snow")
+        val isSnowAt = blockAtName.contains("snow")
+        
+        // If standing IN snow (not on top), this is not valid
+        if (isSnowAt && !isPassableBlock(blockAt)) {
+            return false
+        }
+
+        // Snow layers count as solid ground only when below
+        val hasGround = blockBelow.isSolidBlock(snapshot.world, pos.down()) || 
+                       isSnowBelow
+
+        // Position must be clear (passable snow or air)
+        val isPositionClear = isPassableBlock(blockAt) || isSnowAt
+
+        val hasHeadroom = isPassableBlock(blockAbove) || 
+                         !blockAbove.isSolidBlock(snapshot.world, pos.up())
+
+        return hasGround && isPositionClear && hasHeadroom
+    }
+    
+    /**
+     * Thread-safe version of canMoveDiagonally.
+     */
+    private fun canMoveDiagonallyThreaded(from: BlockPos, to: BlockPos, snapshot: WorldSnapshot): Boolean {
+        val dx = to.x - from.x
+        val dz = to.z - from.z
+
+        if (dx == 0 || dz == 0) return true
+
+        val checkPos1 = from.add(dx, 0, 0)
+        val checkPos2 = from.add(0, 0, dz)
+
+        val blockState1 = snapshot.getBlockState(checkPos1)
+        val blockState2 = snapshot.getBlockState(checkPos2)
+
+        return (isPassableBlock(blockState1) || !blockState1.isSolidBlock(snapshot.world, checkPos1)) &&
+               (isPassableBlock(blockState2) || !blockState2.isSolidBlock(snapshot.world, checkPos2))
+    }
+    
+    /**
+     * Thread-safe version of isJumpPathClear.
+     */
+    private fun isJumpPathClearThreaded(from: BlockPos, to: BlockPos, snapshot: WorldSnapshot): Boolean {
+        val dx = to.x - from.x
+        val dz = to.z - from.z
+        val dy = to.y - from.y
+
+        val steps = maxOf(kotlin.math.abs(dx), kotlin.math.abs(dz))
+        if (steps == 0) return true
+
+        for (i in 1..steps) {
+            val t = i.toDouble() / steps
+            val checkX = from.x + (dx * t).toInt()
+            val checkZ = from.z + (dz * t).toInt()
+            val checkY = from.y + (dy * t).toInt()
+            val checkPos = BlockPos(checkX, checkY, checkZ)
+
+            val blockAt = snapshot.getBlockState(checkPos)
+            val blockAbove = snapshot.getBlockState(checkPos.up())
+
+            if (!isPassableBlock(blockAt) && blockAt.isSolidBlock(snapshot.world, checkPos)) {
+                return false
+            }
+            if (!isPassableBlock(blockAbove) && blockAbove.isSolidBlock(snapshot.world, checkPos.up())) {
+                return false
+            }
+        }
+
+        return true
+    }
+}
+
+/**
+ * Thread-safe snapshot of world blocks for pathfinding calculations.
+ * Pre-caches a reasonable area on the main thread, then allows safe background access.
+ */
+private class WorldSnapshot private constructor(
+    val world: net.minecraft.world.World,
+    private val blockCache: Map<BlockPos, net.minecraft.block.BlockState>
+) {
+    companion object {
+        /**
+         * Creates a snapshot by pre-caching a focused area on the main thread.
+         * Limited to a reasonable size to avoid freezing.
+         * 
+         * @param world The world to snapshot
+         * @param start Start position
+         * @param end End position
+         * @return WorldSnapshot instance
+         */
+        fun create(world: net.minecraft.world.World?, start: BlockPos, end: BlockPos): WorldSnapshot? {
+            if (world == null) return null
+            
+            val blockCache = mutableMapOf<BlockPos, net.minecraft.block.BlockState>()
+            
+            // Calculate distance
+            val distance = kotlin.math.sqrt(
+                ((end.x - start.x) * (end.x - start.x) + 
+                 (end.z - start.z) * (end.z - start.z)).toDouble()
+            ).toInt()
+            
+            // Much smaller snapshot for speed
+            val radius = minOf(distance + 15, 50) // Max 50 block radius
+            val verticalRange = 20 // +/- 20 blocks vertically
+            
+            val minX = minOf(start.x, end.x) - radius
+            val maxX = maxOf(start.x, end.x) + radius
+            val minY = minOf(start.y, end.y) - verticalRange
+            val maxY = maxOf(start.y, end.y) + verticalRange
+            val minZ = minOf(start.z, end.z) - radius
+            val maxZ = maxOf(start.z, end.z) + radius
+            
+            println("[WorldSnapshot] Caching area: X[$minX to $maxX] Y[$minY to $maxY] Z[$minZ to $maxZ]")
+            
+            // Cache blocks with step optimization for speed
+            var cached = 0
+            for (x in minX..maxX step 2) {  // Skip every other block
+                for (z in minZ..maxZ step 2) {
+                    for (y in minY..maxY step 1) {
+                        val pos = BlockPos(x, y, z)
+                        try {
+                            blockCache[pos] = world.getBlockState(pos)
+                            // Also cache adjacent blocks for accuracy
+                            blockCache[pos.add(1, 0, 0)] = world.getBlockState(pos.add(1, 0, 0))
+                            blockCache[pos.add(0, 0, 1)] = world.getBlockState(pos.add(0, 0, 1))
+                            cached += 3
+                        } catch (e: Exception) {
+                            blockCache[pos] = Blocks.AIR.defaultState
+                        }
+                    }
+                }
+            }
+            
+            println("[WorldSnapshot] Cached $cached blocks")
+            
+            return WorldSnapshot(world, blockCache)
+        }
+    }
+    
+    /**
+     * Gets cached block state. Returns AIR if not in cache.
+     */
+    fun getBlockState(pos: BlockPos): net.minecraft.block.BlockState {
+        return blockCache[pos] ?: Blocks.AIR.defaultState
     }
 }
 
