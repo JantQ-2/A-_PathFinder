@@ -14,7 +14,7 @@ object PathCommand : Command(
 
     @DefaultHandler
     fun main() {
-        ChatUtils.sendMessage("§7Path commands: §fgoto <x> <y> <z>§7, §fstop§7, §fstatus")
+        ChatUtils.sendMessage("§7Path commands: §fgoto <x> <y> <z>§7, §fstop§7, §fstatus§7, §fdebug")
     }
 
     @SubCommand
@@ -38,6 +38,28 @@ object PathCommand : Command(
             "§7Inactive"
         }
         ChatUtils.sendMessage("§7Pathfinding status: $status")
+    }
+    
+    @SubCommand
+    fun debug() {
+        ChatUtils.sendMessage("§7Debug subcommands: §finfo§7, §fload")
+    }
+    
+    @SubCommand
+    fun info() {
+        val info = PathfinderCore.getDebugInfo()
+        info.lines().forEach { line ->
+            if (line.isNotBlank()) ChatUtils.sendMessage(line)
+        }
+    }
+    
+    @SubCommand
+    fun load() {
+        ChatUtils.sendMessage("§7Loading all chunks from disk...")
+        Thread {
+            val (chunks, blocks) = PathfinderCore.debugLoadAllChunks()
+            ChatUtils.sendMessage("§aLoaded §f$chunks §achunks with §f$blocks §ablocks into memory")
+        }.apply { isDaemon = true }.start()
     }
 }
 

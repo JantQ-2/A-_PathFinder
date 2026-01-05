@@ -17,18 +17,23 @@ import org.cobalt.api.pathfinder.IPathExec
 import org.cobalt.api.util.render.Render3D
 import org.cobalt.api.util.PlayerUtils.position
 import java.awt.Color
+import java.io.File
 import java.util.*
 import java.util.Collections
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executors
 import kotlin.math.sqrt
+import com.google.gson.Gson
+import com.google.gson.GsonBuilder
+import com.google.gson.JsonObject
+import com.google.gson.JsonArray
 
 object PathfinderCore : IPathExec {
 
     private const val STUCK_THRESHOLD = 100
     private const val STUCK_AREA_RADIUS = 2
     private const val MAX_ITERATIONS = 15000  // Reduced for faster pathfinding
-    private const val RECALC_COOLDOWN = 1000L 
+    private const val RECALC_COOLDOWN = 3000L  // 3 seconds cooldown between recalculations
     private const val MAX_FALL_DISTANCE = 20  // Reduced to explore fewer neighbors
     
     private const val JUMP_COST_MULTIPLIER = 1.5
@@ -54,7 +59,12 @@ object PathfinderCore : IPathExec {
     private var pathCalculationFuture: CompletableFuture<List<BlockPos>?>? = null
     
     /** Flag to indicate if a path calculation is in progress */
+    @Volatile
     private var isCalculating = false
+    
+    /** Flag to signal cancellation to background thread */
+    @Volatile
+    private var isCancelled = false
     
     /** Cached world snapshot for thread-safe access */
     private var worldSnapshot: WorldSnapshot? = null
@@ -219,6 +229,12 @@ object PathfinderCore : IPathExec {
         currentIndex = 0
         shouldKeepSneak = false
         mc.options.sneakKey.setPressed(false)
+        
+        // Start automatic chunk caching when pathfinding begins
+        val world = mc.world
+        if (world != null) {
+            WorldSnapshot.startChunkCaching(world)
+        }
     }
 
     /**
@@ -226,6 +242,9 @@ object PathfinderCore : IPathExec {
      * Call this to cancel pathfinding.
      */
     fun clearPath() {
+        // Signal cancellation to background thread
+        isCancelled = true
+        
         // Cancel any ongoing calculation
         pathCalculationFuture?.cancel(true)
         pathCalculationFuture = null
@@ -242,6 +261,9 @@ object PathfinderCore : IPathExec {
         
         // Release look lock
         MovementController.stopRotation()
+        
+        // Stop chunk caching when pathfinding ends
+        WorldSnapshot.stopChunkCaching()
     }
 
     /**
@@ -255,6 +277,19 @@ object PathfinderCore : IPathExec {
      * @return List of waypoints, or null if no path exists
      */
     fun getCurrentPath(): List<BlockPos>? = currentPath
+    
+    /**
+     * Debug: Get info about the world cache
+     */
+    fun getDebugInfo(): String = WorldSnapshot.getDebugInfo()
+    
+    /**
+     * Debug: Force load all chunks from disk
+     */
+    fun debugLoadAllChunks(): Pair<Int, Int> {
+        val world = mc.world ?: return Pair(0, 0)
+        return WorldSnapshot.debugLoadAllChunks(world)
+    }
 
     /**
      * Main pathfinding tick update - called every game tick.
@@ -279,6 +314,12 @@ object PathfinderCore : IPathExec {
         // Hold Aspect item if available
         holdAspectItem(player)
         
+        // Tick gradual chunk loading (1 chunk per tick)
+        val world = mc.world
+        if (world != null) {
+            WorldSnapshot.tickChunkLoading(world)
+        }
+        
         val currentTime = System.currentTimeMillis()
         val playerPos = BlockPos.ofFloored(player.x, player.y, player.z)
 
@@ -301,7 +342,10 @@ object PathfinderCore : IPathExec {
         
         lastPlayerPos = playerPos
 
-        val shouldRecalculate = stuckTicks > STUCK_THRESHOLD
+        // Only trigger recalculation if stuck AND cooldown has passed AND we have a path already
+        val shouldRecalculate = stuckTicks > STUCK_THRESHOLD && 
+                                currentPath != null && 
+                                (currentTime - lastRecalcTime) > RECALC_COOLDOWN
 
         // Check if async calculation completed
         pathCalculationFuture?.let { future ->
@@ -347,32 +391,54 @@ object PathfinderCore : IPathExec {
         if ((currentPath == null || shouldRecalculate) && !isCalculating) {
             if (shouldRecalculate) {
                 if (DEBUG) println("[Pathfinder] Stuck detected, recalculating path")
+                lastRecalcTime = currentTime  // Update recalc time to prevent rapid recalcs
             }
             
-            // Capture world reference on main thread
-            val world = mc.world
+            // Check if world is available
             if (world == null) {
                 if (DEBUG) println("[Pathfinder] World is null, cannot pathfind")
                 return
             }
             
             isCalculating = true
+            isCancelled = false  // Reset cancellation flag for new calculation
             
-            // Create snapshot on main thread (fast - just captures reference)
-            worldSnapshot = WorldSnapshot.create(world, playerPos, target)
-            if (worldSnapshot == null) {
-                if (DEBUG) println("[Pathfinder] Failed to create world snapshot")
-                isCalculating = false
-                return
-            }
+            // Queue chunks for gradual loading
+            WorldSnapshot.queueChunksForLoading(playerPos, target)
             
-            if (DEBUG) println("[Pathfinder] Starting async path calculation from $playerPos to $target")
+            if (DEBUG) println("[Pathfinder] Queued chunks for loading. Waiting for chunks to load...")
+        }
+        
+        // Start pathfinding once chunks are loaded
+        if (isCalculating && WorldSnapshot.isReadyForPathfinding && pathCalculationFuture == null) {
+            val pathWorld = mc.world ?: return
             
-            // Start async pathfinding in background thread
+            if (DEBUG) println("[Pathfinder] Chunks loaded! Starting path calculation from $playerPos to $target")
+            
+            val startPos = playerPos
+            val endPos = target
             pathCalculationFuture = CompletableFuture.supplyAsync({
                 try {
+                    // Check for cancellation
+                    if (isCancelled) {
+                        if (DEBUG) println("[Pathfinder-Thread] Cancelled before pathfinding")
+                        return@supplyAsync null
+                    }
+                    
+                    // Use the shared cache that was loaded gradually
+                    val snapshot = WorldSnapshot.createFromSharedCache(pathWorld)
+                    worldSnapshot = snapshot
+                    
+                    // Calculate path
                     if (DEBUG) println("[Pathfinder-Thread] Calculating path...")
-                    val result = findPathThreaded(playerPos, target)
+                    val result = findPathThreaded(startPos, endPos)
+                    
+                    // Check for cancellation after pathfinding
+                    if (isCancelled) {
+                        if (DEBUG) println("[Pathfinder-Thread] Cancelled after pathfinding")
+                        return@supplyAsync null
+                    }
+                    
                     if (DEBUG) println("[Pathfinder-Thread] Path calculated: ${result?.size ?: 0} waypoints")
                     result
                 } catch (e: Exception) {
@@ -449,7 +515,8 @@ object PathfinderCore : IPathExec {
             if (passedVertically) currentIndex++
         }
 
-        val world = mc.world ?: return
+        // Ensure world is available for movement calculations
+        val movementWorld = world ?: return
         val maxJumpDist = getMaxJumpDistance(player).toDouble()
         val maxJumpHeight = getMaxJumpHeight(player)
         val lookAheadCount = minOf(15, (maxJumpDist * 1.5).toInt() + 5)
@@ -472,8 +539,8 @@ object PathfinderCore : IPathExec {
                 val checkPos = BlockPos.ofFloored(futureNode.x.toDouble(), maxY.toDouble(), futureNode.z.toDouble())
                 
                 (minY..maxY + 2).all { y ->
-                    val blockAbove = world.getBlockState(checkPos.withY(y))
-                    isPassableBlock(blockAbove) || !blockAbove.isSolidBlock(world, checkPos.withY(y))
+                    val blockAbove = movementWorld.getBlockState(checkPos.withY(y))
+                    isPassableBlock(blockAbove) || !blockAbove.isSolidBlock(movementWorld, checkPos.withY(y))
                 }
             }
 
@@ -492,8 +559,8 @@ object PathfinderCore : IPathExec {
                     val checkY = player.blockPos.y
 
                     val checkPos = BlockPos(checkX, checkY, checkZ)
-                    val blockAtHead = world.getBlockState(checkPos.up())
-                    val blockAboveHead = world.getBlockState(checkPos.up(2))
+                    val blockAtHead = movementWorld.getBlockState(checkPos.up())
+                    val blockAboveHead = movementWorld.getBlockState(checkPos.up(2))
 
                     if (!isPassableBlock(blockAboveHead) && isPassableBlock(blockAtHead)) {
                         has2BlockClearance = false
@@ -747,10 +814,16 @@ object PathfinderCore : IPathExec {
             pos.add(0, 1, 1), pos.add(0, 1, -1)
         )
 
+        var avoidBlockPenalty = 0.0
+        
         for (checkPos in checkPositions) {
             val blockState = world.getBlockState(checkPos)
             if (blockState.isSolidBlock(world, checkPos) && !isPassableBlock(blockState)) {
                 wallCount++
+            }
+            // Massive penalty for glass panes, glass blocks, fences etc - completely avoid them
+            if (isAvoidBlock(blockState)) {
+                avoidBlockPenalty += 50.0  // Massive penalty to force avoidance
             }
         }
         
@@ -780,7 +853,7 @@ object PathfinderCore : IPathExec {
             else -> 0.0 
         }
         
-        return basePenalty + squeezePenalty
+        return basePenalty + squeezePenalty + avoidBlockPenalty
     }
 
     /**
@@ -815,6 +888,33 @@ object PathfinderCore : IPathExec {
                                  blockBelowName.contains("stair")
         val isSnowBelow = blockBelowName.contains("snow")
         val isSnowAtFeet = blockAtFeetName.contains("snow")
+        
+        // If snow is below, check that there's actual solid ground under the snow
+        val hasGroundUnderSnow = if (isSnowBelow) {
+            // Look for solid ground under the snow layers
+            var checkPos = pos.down(2)
+            var foundSolid = false
+            for (i in 1..8) {
+                val checkState = world.getBlockState(checkPos)
+                val checkName = checkState.block.toString().lowercase()
+                if (checkName.contains("snow")) {
+                    checkPos = checkPos.down()
+                } else if (checkState.isSolidBlock(world, checkPos)) {
+                    foundSolid = true
+                    break
+                } else {
+                    // Found air or non-solid under snow - not valid ground
+                    break
+                }
+            }
+            foundSolid
+        } else {
+            true  // No snow below, will check normal ground later
+        }
+        
+        if (isSnowBelow && !hasGroundUnderSnow) {
+            return false  // Snow floating on air - not walkable
+        }
 
         if (isSnowBelow && !isPassableBlock(blockState) && !isSnowAtFeet) {
             return false
@@ -989,6 +1089,26 @@ object PathfinderCore : IPathExec {
     }
 
     /**
+     * Checks if a block should be heavily avoided during pathfinding.
+     * These include glass panes, fences, iron bars, walls, and glass blocks.
+     * 
+     * @param blockState The block state to check
+     * @return true if the block should be avoided
+     */
+    private fun isAvoidBlock(blockState: net.minecraft.block.BlockState): Boolean {
+        if (blockState.isAir) return false
+        
+        val blockName = blockState.block.toString().lowercase()
+        
+        return blockName.contains("glass_pane") ||
+               blockName.contains("glass") ||  // All glass blocks
+               blockName.contains("iron_bars") ||
+               blockName.contains("fence") ||
+               blockName.contains("wall") && !blockName.contains("wallsign") ||
+               blockName.contains("chain")
+    }
+    
+    /**
      * Determines if a block can be walked through (non-solid).
      * 
      * Passable blocks include:
@@ -1011,6 +1131,9 @@ object PathfinderCore : IPathExec {
         val block = blockState.block
         val blockName = block.toString().lowercase()
         
+        // Glass panes are NOT passable - treat as solid
+        if (blockName.contains("glass_pane")) return false
+        if (blockName.contains("iron_bars")) return false
         
         if (blockState.isIn(BlockTags.FLOWERS)) return true
         if (blockState.isIn(BlockTags.SAPLINGS)) return true
@@ -1333,7 +1456,8 @@ object PathfinderCore : IPathExec {
 
         while (openSet.isNotEmpty() && iterations < MAX_ITERATIONS) {
             // Check if calculation was cancelled
-            if (Thread.currentThread().isInterrupted) {
+            if (isCancelled || Thread.currentThread().isInterrupted) {
+                if (DEBUG) println("[Pathfinder-Thread] Path calculation cancelled at iteration $iterations")
                 return null
             }
             
@@ -1527,10 +1651,16 @@ object PathfinderCore : IPathExec {
             pos.add(0, 0, 1), pos.add(0, 0, -1)
         )
 
+        var avoidBlockPenalty = 0.0
+        
         for (checkPos in checkPositions) {
             val blockState = snapshot.getBlockState(checkPos)
             if (blockState.isSolidBlock(snapshot.world, checkPos) && !isPassableBlock(blockState)) {
                 wallCount++
+            }
+            // Massive penalty for glass panes, glass blocks, fences etc - completely avoid them
+            if (isAvoidBlock(blockState)) {
+                avoidBlockPenalty += 50.0  // Massive penalty to force avoidance
             }
         }
         
@@ -1560,7 +1690,7 @@ object PathfinderCore : IPathExec {
             else -> 0.0 
         }
         
-        return basePenalty + squeezePenalty
+        return basePenalty + squeezePenalty + avoidBlockPenalty
     }
     
     /**
@@ -1578,14 +1708,40 @@ object PathfinderCore : IPathExec {
         val isSnowBelow = blockBelowName.contains("snow")
         val isSnowAt = blockAtName.contains("snow")
         
+        // If snow is below, verify there's actual solid ground under it
+        val hasGroundUnderSnow = if (isSnowBelow) {
+            var checkPos = pos.down(2)
+            var foundSolid = false
+            for (i in 1..8) {
+                val checkState = snapshot.getBlockState(checkPos)
+                val checkName = checkState.block.translationKey
+                if (checkName.contains("snow")) {
+                    checkPos = checkPos.down()
+                } else if (checkState.isSolidBlock(snapshot.world, checkPos)) {
+                    foundSolid = true
+                    break
+                } else {
+                    break  // Found air or non-solid under snow
+                }
+            }
+            foundSolid
+        } else {
+            true
+        }
+        
         // If standing IN snow (not on top), this is not valid
         if (isSnowAt && !isPassableBlock(blockAt)) {
             return false
         }
+        
+        // Snow floating on air is not walkable
+        if (isSnowBelow && !hasGroundUnderSnow) {
+            return false
+        }
 
-        // Snow layers count as solid ground only when below
+        // Snow layers count as solid ground only when there's real ground under them
         val hasGround = blockBelow.isSolidBlock(snapshot.world, pos.down()) || 
-                       isSnowBelow
+                       (isSnowBelow && hasGroundUnderSnow)
 
         // Position must be clear (passable snow or air)
         val isPositionClear = isPassableBlock(blockAt) || isSnowAt
@@ -1654,69 +1810,687 @@ object PathfinderCore : IPathExec {
  */
 private class WorldSnapshot private constructor(
     val world: net.minecraft.world.World,
-    private val blockCache: Map<BlockPos, net.minecraft.block.BlockState>
+    private val blockCache: MutableMap<BlockPos, net.minecraft.block.BlockState>
 ) {
     companion object {
+        private val gson = GsonBuilder().create()  // No pretty printing for faster I/O
+        private val cacheDirectory = File("pathfinder_cache")
+        private var currentAreaName = "unknown"
+        private var isBackgroundCachingActive = false
+        
+        /** Set of chunk coordinates that have been cached to disk */
+        private val cachedChunksToDisk = Collections.synchronizedSet(mutableSetOf<Pair<Int, Int>>())
+        
+        /** Set of chunks currently loaded in memory */
+        private val loadedChunksInMemory = Collections.synchronizedSet(mutableSetOf<Pair<Int, Int>>())
+        
+        /** Shared block cache for gradual loading */
+        private val sharedBlockCache = Collections.synchronizedMap(mutableMapOf<BlockPos, net.minecraft.block.BlockState>())
+        
+        /** Queue of chunks to load gradually */
+        private val chunkLoadQueue = java.util.concurrent.ConcurrentLinkedQueue<Pair<Int, Int>>()
+        
+        /** Flag indicating if gradual loading is ready for pathfinding */
+        @Volatile
+        var isReadyForPathfinding = false
+            private set
+        
+        /** Required chunks for current pathfinding request */
+        private val requiredChunks = Collections.synchronizedSet(mutableSetOf<Pair<Int, Int>>())
+        
+        init {
+            if (!cacheDirectory.exists()) {
+                cacheDirectory.mkdirs()
+            }
+            // Load the list of cached chunks on startup
+            loadCachedChunksList()
+        }
+        
         /**
-         * Creates a snapshot by pre-caching a focused area on the main thread.
-         * Limited to a reasonable size to avoid freezing.
-         * 
-         * @param world The world to snapshot
-         * @param start Start position
-         * @param end End position
-         * @return WorldSnapshot instance
+         * Called every game tick to load 1 chunk into memory.
+         * Call this from the main tick loop.
          */
-        fun create(world: net.minecraft.world.World?, start: BlockPos, end: BlockPos): WorldSnapshot? {
-            if (world == null) return null
+        fun tickChunkLoading(world: net.minecraft.world.World) {
+            val chunk = chunkLoadQueue.poll() ?: return
             
-            val blockCache = mutableMapOf<BlockPos, net.minecraft.block.BlockState>()
+            val (chunkX, chunkZ) = chunk
+            val chunkFile = getChunkCacheFile(chunkX, chunkZ)
             
-            // Calculate distance
-            val distance = kotlin.math.sqrt(
-                ((end.x - start.x) * (end.x - start.x) + 
-                 (end.z - start.z) * (end.z - start.z)).toDouble()
-            ).toInt()
+            if (chunkFile.exists()) {
+                val loaded = loadChunkFromDiskIntoShared(chunkX, chunkZ)
+                if (loaded > 0) {
+                    loadedChunksInMemory.add(chunk)
+                }
+            } else {
+                // Load from world
+                val loaded = loadChunkFromWorldIntoShared(world, chunkX, chunkZ)
+                if (loaded > 0) {
+                    loadedChunksInMemory.add(chunk)
+                    // Save to disk in background
+                    Thread {
+                        saveChunkToDisk(world, chunkX, chunkZ)
+                        cachedChunksToDisk.add(chunk)
+                        saveCachedChunksIndex()
+                    }.apply { isDaemon = true }.start()
+                }
+            }
             
-            // Much smaller snapshot for speed
-            val radius = minOf(distance + 15, 50) // Max 50 block radius
-            val verticalRange = 20 // +/- 20 blocks vertically
+            // Check if all required chunks are loaded
+            if (requiredChunks.isNotEmpty() && requiredChunks.all { it in loadedChunksInMemory }) {
+                isReadyForPathfinding = true
+                println("[WorldSnapshot] All ${requiredChunks.size} required chunks loaded! Ready for pathfinding.")
+            }
+        }
+        
+        /**
+         * Gets the number of chunks remaining to load.
+         */
+        fun getChunksRemaining(): Int = chunkLoadQueue.size
+        
+        /**
+         * Queues chunks for gradual loading.
+         */
+        fun queueChunksForLoading(startPos: BlockPos, endPos: BlockPos) {
+            val startChunkX = startPos.x shr 4
+            val startChunkZ = startPos.z shr 4
+            val endChunkX = endPos.x shr 4
+            val endChunkZ = endPos.z shr 4
             
-            val minX = minOf(start.x, end.x) - radius
-            val maxX = maxOf(start.x, end.x) + radius
-            val minY = minOf(start.y, end.y) - verticalRange
-            val maxY = maxOf(start.y, end.y) + verticalRange
-            val minZ = minOf(start.z, end.z) - radius
-            val maxZ = maxOf(start.z, end.z) + radius
+            val minChunkX = minOf(startChunkX, endChunkX) - 3
+            val maxChunkX = maxOf(startChunkX, endChunkX) + 3
+            val minChunkZ = minOf(startChunkZ, endChunkZ) - 3
+            val maxChunkZ = maxOf(startChunkZ, endChunkZ) + 3
             
-            println("[WorldSnapshot] Caching area: X[$minX to $maxX] Y[$minY to $maxY] Z[$minZ to $maxZ]")
+            requiredChunks.clear()
+            chunkLoadQueue.clear()
+            isReadyForPathfinding = false
             
-            // Cache blocks with step optimization for speed
+            var queued = 0
+            for (chunkX in minChunkX..maxChunkX) {
+                for (chunkZ in minChunkZ..maxChunkZ) {
+                    val chunkPos = Pair(chunkX, chunkZ)
+                    requiredChunks.add(chunkPos)
+                    
+                    if (chunkPos !in loadedChunksInMemory) {
+                        chunkLoadQueue.add(chunkPos)
+                        queued++
+                    }
+                }
+            }
+            
+            // If all chunks already loaded, we're ready immediately
+            if (queued == 0) {
+                isReadyForPathfinding = true
+                println("[WorldSnapshot] All chunks already in memory! Ready immediately.")
+            } else {
+                println("[WorldSnapshot] Queued $queued chunks for gradual loading (1 per tick)")
+            }
+        }
+        
+        /**
+         * Loads a chunk from disk into the shared cache.
+         */
+        private fun loadChunkFromDiskIntoShared(chunkX: Int, chunkZ: Int): Int {
+            val chunkFile = getChunkCacheFile(chunkX, chunkZ)
+            if (!chunkFile.exists()) return 0
+            
+            try {
+                val jsonText = chunkFile.readText()
+                val json = gson.fromJson(jsonText, JsonObject::class.java)
+                val blocksArray = json.getAsJsonArray("blocks")
+                var loaded = 0
+                
+                for (element in blocksArray) {
+                    val obj = element.asJsonObject
+                    val x = obj.get("x").asInt
+                    val y = obj.get("y").asInt
+                    val z = obj.get("z").asInt
+                    val blockId = obj.get("block").asString
+                    
+                    val pos = BlockPos(x, y, z)
+                    val block = net.minecraft.registry.Registries.BLOCK.get(
+                        net.minecraft.util.Identifier.of(blockId)
+                    )
+                    sharedBlockCache[pos] = block.defaultState
+                    loaded++
+                }
+                
+                return loaded
+            } catch (e: Exception) {
+                return 0
+            }
+        }
+        
+        /**
+         * Loads a chunk from world into the shared cache.
+         */
+        private fun loadChunkFromWorldIntoShared(world: net.minecraft.world.World, chunkX: Int, chunkZ: Int): Int {
+            val startX = chunkX shl 4
+            val startZ = chunkZ shl 4
+            var loaded = 0
+            
+            try {
+                for (x in startX until startX + 16) {
+                    for (z in startZ until startZ + 16) {
+                        for (y in world.bottomY until (world.bottomY + world.height)) {
+                            val pos = BlockPos(x, y, z)
+                            val state = world.getBlockState(pos)
+                            sharedBlockCache[pos] = state
+                            loaded++
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                // Chunk might not be loaded
+            }
+            
+            return loaded
+        }
+        
+        /**
+         * Creates a snapshot using the shared cache.
+         */
+        fun createFromSharedCache(world: net.minecraft.world.World): WorldSnapshot {
+            return WorldSnapshot(world, sharedBlockCache)
+        }
+        
+        init {
+            if (!cacheDirectory.exists()) {
+                cacheDirectory.mkdirs()
+            }
+            // Load the list of cached chunks on startup
+            loadCachedChunksList()
+        }
+        
+        /**
+         * Loads the list of already cached chunks from the chunks index file.
+         */
+        private fun loadCachedChunksList() {
+            try {
+                val indexFile = File(cacheDirectory, "chunks_index.json")
+                if (indexFile.exists()) {
+                    val json = gson.fromJson(indexFile.readText(), JsonObject::class.java)
+                    val chunksArray = json.getAsJsonArray("chunks")
+                    for (element in chunksArray) {
+                        val obj = element.asJsonObject
+                        cachedChunksToDisk.add(Pair(obj.get("x").asInt, obj.get("z").asInt))
+                    }
+                    println("[WorldSnapshot] Found ${cachedChunksToDisk.size} chunks saved on disk")
+                }
+            } catch (e: Exception) {
+                println("[WorldSnapshot] Failed to load chunks index: ${e.message}")
+            }
+        }
+        
+        /**
+         * Saves the list of cached chunks to index file.
+         */
+        private fun saveCachedChunksIndex() {
+            try {
+                val indexFile = File(cacheDirectory, "chunks_index.json")
+                val json = JsonObject()
+                val chunksArray = JsonArray()
+                for ((x, z) in cachedChunksToDisk) {
+                    val obj = JsonObject()
+                    obj.addProperty("x", x)
+                    obj.addProperty("z", z)
+                    chunksArray.add(obj)
+                }
+                json.add("chunks", chunksArray)
+                json.addProperty("count", cachedChunksToDisk.size)
+                indexFile.writeText(gson.toJson(json))
+            } catch (e: Exception) {
+                println("[WorldSnapshot] Failed to save chunks index: ${e.message}")
+            }
+        }
+        
+        /**
+         * Gets the cache file for a specific chunk.
+         */
+        private fun getChunkCacheFile(chunkX: Int, chunkZ: Int): File {
+            val chunkDir = File(cacheDirectory, currentAreaName)
+            if (!chunkDir.exists()) chunkDir.mkdirs()
+            return File(chunkDir, "chunk_${chunkX}_${chunkZ}.json")
+        }
+        
+        /**
+         * Extracts area name from tablist (e.g., "Dwarven Mines").
+         */
+        private fun getAreaNameFromTablist(): String {
+            try {
+                val mc = MinecraftClient.getInstance()
+                val playerListHud = mc.inGameHud?.playerListHud
+                
+                if (playerListHud != null) {
+                    // Try to extract from player list entries
+                    val playerList = mc.networkHandler?.playerList
+                    if (playerList != null) {
+                        for (entry in playerList) {
+                            val displayName = entry.displayName?.string ?: continue
+                            
+                            // Look for area name in display (e.g., "Area: Dwarven Mines")
+                            if (displayName.contains("Area:", ignoreCase = true)) {
+                                val parts = displayName.split("Area:", ignoreCase = true)
+                                if (parts.size > 1) {
+                                    val areaName = parts[1].trim()
+                                        .replace(Regex("[^a-zA-Z0-9 ]"), "") // Remove special chars
+                                        .replace(" ", "_")
+                                        .lowercase()
+                                    if (areaName.isNotEmpty()) return areaName
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                println("[WorldSnapshot] Failed to get area from tablist: ${e.message}")
+            }
+            return "unknown"
+        }
+        
+        /**
+         * Gets the cache file for the current world/area.
+         */
+        private fun getCacheFile(world: net.minecraft.world.World): File {
+            // Update area name from tablist
+            val areaName = getAreaNameFromTablist()
+            if (areaName != "unknown") {
+                currentAreaName = areaName
+            }
+            
+            // Use area name and dimension as filename
+            val dimension = world.registryKey.value.toString().replace(':', '_')
+            val fileName = if (currentAreaName != "unknown") {
+                "${currentAreaName}_${dimension}.json"
+            } else {
+                "world_${dimension}.json"
+            }
+            return File(cacheDirectory, fileName)
+        }
+        /**
+         * Starts monitoring for new chunk loads and saves them to disk automatically.
+         * This builds up the persistent world cache over time.
+         */
+        fun startChunkCaching(world: net.minecraft.world.World) {
+            if (isBackgroundCachingActive) return
+            isBackgroundCachingActive = true
+            
+            // Update area name
+            val areaName = getAreaNameFromTablist()
+            if (areaName != "unknown") {
+                currentAreaName = areaName
+            }
+            
+            Thread {
+                try {
+                    println("[WorldSnapshot] Started automatic chunk caching for ${currentAreaName}")
+                    println("[WorldSnapshot] Already have ${cachedChunksToDisk.size} chunks saved on disk")
+                    
+                    while (isBackgroundCachingActive) {
+                        try {
+                            val mc = MinecraftClient.getInstance()
+                            val player = mc.player
+                            if (player != null) {
+                                val playerChunkX = (player.x.toInt()) shr 4
+                                val playerChunkZ = (player.z.toInt()) shr 4
+                                val renderDistance = mc.options.viewDistance.value
+                                
+                                for (chunkX in (playerChunkX - renderDistance)..(playerChunkX + renderDistance)) {
+                                    for (chunkZ in (playerChunkZ - renderDistance)..(playerChunkZ + renderDistance)) {
+                                        val chunkPos = Pair(chunkX, chunkZ)
+                                        
+                                        if (chunkPos !in cachedChunksToDisk) {
+                                            // Save this chunk to disk for future use
+                                            saveChunkToDisk(world, chunkX, chunkZ)
+                                            cachedChunksToDisk.add(chunkPos)
+                                            
+                                            // Small delay to prevent lag
+                                            Thread.sleep(50)
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            // Save chunks index periodically
+                            saveCachedChunksIndex()
+                            
+                            // Check every 5 seconds
+                            Thread.sleep(5000)
+                        } catch (e: Exception) {
+                            println("[WorldSnapshot] Chunk caching error: ${e.message}")
+                        }
+                    }
+                } catch (e: Exception) {
+                    println("[WorldSnapshot] Chunk caching thread error: ${e.message}")
+                }
+            }.apply {
+                isDaemon = true
+                priority = Thread.MIN_PRIORITY
+            }.start()
+        }
+        
+        /**
+         * Stops automatic chunk caching.
+         */
+        fun stopChunkCaching() {
+            isBackgroundCachingActive = false
+            saveCachedChunksIndex()
+            println("[WorldSnapshot] Stopped automatic chunk caching")
+        }
+        
+        /**
+         * Saves all blocks in a chunk to disk (JSON file).
+         */
+        private fun saveChunkToDisk(world: net.minecraft.world.World, chunkX: Int, chunkZ: Int) {
+            val startX = chunkX shl 4
+            val startZ = chunkZ shl 4
+            val blocksArray = JsonArray()
             var cached = 0
-            for (x in minX..maxX step 2) {  // Skip every other block
-                for (z in minZ..maxZ step 2) {
-                    for (y in minY..maxY step 1) {
+            var skippedAir = 0
+            
+            for (x in startX until startX + 16) {
+                for (z in startZ until startZ + 16) {
+                    for (y in world.bottomY until (world.bottomY + world.height)) {
                         val pos = BlockPos(x, y, z)
                         try {
-                            blockCache[pos] = world.getBlockState(pos)
-                            // Also cache adjacent blocks for accuracy
-                            blockCache[pos.add(1, 0, 0)] = world.getBlockState(pos.add(1, 0, 0))
-                            blockCache[pos.add(0, 0, 1)] = world.getBlockState(pos.add(0, 0, 1))
-                            cached += 3
+                            val state = world.getBlockState(pos)
+                            // Skip air blocks to save space
+                            if (state.isAir) {
+                                skippedAir++
+                                continue
+                            }
+                            
+                            val blockObj = JsonObject()
+                            blockObj.addProperty("x", pos.x)
+                            blockObj.addProperty("y", pos.y)
+                            blockObj.addProperty("z", pos.z)
+                            val blockId = net.minecraft.registry.Registries.BLOCK.getId(state.block)
+                            blockObj.addProperty("block", blockId.toString())
+                            blocksArray.add(blockObj)
+                            cached++
                         } catch (e: Exception) {
-                            blockCache[pos] = Blocks.AIR.defaultState
+                            // Skip failed blocks
                         }
                     }
                 }
             }
             
-            println("[WorldSnapshot] Cached $cached blocks")
+            // Save chunk to its own file
+            if (cached > 0) {
+                try {
+                    val chunkFile = getChunkCacheFile(chunkX, chunkZ)
+                    val json = JsonObject()
+                    json.add("blocks", blocksArray)
+                    json.addProperty("chunk_x", chunkX)
+                    json.addProperty("chunk_z", chunkZ)
+                    json.addProperty("cached_at", System.currentTimeMillis())
+                    json.addProperty("block_count", cached)
+                    chunkFile.writeText(gson.toJson(json))
+                    println("[WorldSnapshot] Saved chunk ($chunkX, $chunkZ): $cached blocks (skipped $skippedAir air)")
+                } catch (e: Exception) {
+                    println("[WorldSnapshot] Failed to save chunk ($chunkX, $chunkZ): ${e.message}")
+                }
+            }
+        }
+        
+        /**
+         * Creates a snapshot for pathfinding.
+         * Loads blocks from disk into memory for fast access.
+         * Also triggers background caching of any new chunks in the path area.
+         * 
+         * @param world The world to snapshot
+         * @param start Start position
+         * @param end End position
+         * @return WorldSnapshot instance with blocks loaded into memory
+         */
+        fun create(world: net.minecraft.world.World?, start: BlockPos, end: BlockPos): WorldSnapshot? {
+            if (world == null) return null
+            
+            // Update area name
+            val areaName = getAreaNameFromTablist()
+            if (areaName != "unknown") {
+                currentAreaName = areaName
+            }
+            
+            // Calculate chunks needed for the path
+            val startChunkX = start.x shr 4
+            val startChunkZ = start.z shr 4
+            val endChunkX = end.x shr 4
+            val endChunkZ = end.z shr 4
+            
+            val minChunkX = minOf(startChunkX, endChunkX) - 3
+            val maxChunkX = maxOf(startChunkX, endChunkX) + 3
+            val minChunkZ = minOf(startChunkZ, endChunkZ) - 3
+            val maxChunkZ = maxOf(startChunkZ, endChunkZ) + 3
+            
+            println("[WorldSnapshot] Need chunks from ($minChunkX, $minChunkZ) to ($maxChunkX, $maxChunkZ)")
+            println("[WorldSnapshot] Have ${cachedChunksToDisk.size} chunks in index, checking overlap...")
+            
+            // Create in-memory cache for pathfinding
+            val blockCache = Collections.synchronizedMap(mutableMapOf<BlockPos, net.minecraft.block.BlockState>())
+            
+            // Load existing chunks from disk into memory
+            var loadedFromDisk = 0
+            var loadedFromWorld = 0
+            var chunksNotFound = 0
+            
+            for (chunkX in minChunkX..maxChunkX) {
+                for (chunkZ in minChunkZ..maxChunkZ) {
+                    val chunkPos = Pair(chunkX, chunkZ)
+                    
+                    // Check if chunk file exists on disk (even if not in index)
+                    val chunkFile = getChunkCacheFile(chunkX, chunkZ)
+                    
+                    if (chunkFile.exists()) {
+                        // Load from disk into memory
+                        val loaded = loadChunkFromDisk(chunkX, chunkZ, blockCache)
+                        if (loaded > 0) {
+                            loadedChunksInMemory.add(chunkPos)
+                            cachedChunksToDisk.add(chunkPos) // Update index
+                            loadedFromDisk++
+                        }
+                    } else {
+                        // Cache from world if chunk file doesn't exist
+                        val cached = loadChunkFromWorld(world, chunkX, chunkZ, blockCache)
+                        if (cached > 0) {
+                            loadedFromWorld++
+                            // Also save to disk in background
+                            val chunkXCopy = chunkX
+                            val chunkZCopy = chunkZ
+                            Thread {
+                                saveChunkToDisk(world, chunkXCopy, chunkZCopy)
+                                cachedChunksToDisk.add(Pair(chunkXCopy, chunkZCopy))
+                                saveCachedChunksIndex()
+                            }.apply { isDaemon = true }.start()
+                        } else {
+                            chunksNotFound++
+                        }
+                    }
+                }
+            }
+            
+            println("[WorldSnapshot] Loaded ${blockCache.size} blocks into memory")
+            println("[WorldSnapshot] - From disk: $loadedFromDisk chunks, From world: $loadedFromWorld chunks, Not found: $chunksNotFound")
             
             return WorldSnapshot(world, blockCache)
+        }
+        
+        /**
+         * Debug: Get info about cached chunks
+         */
+        fun getDebugInfo(): String {
+            val sb = StringBuilder()
+            sb.appendLine("§7=== WorldSnapshot Debug ===")
+            sb.appendLine("§7Area: §f$currentAreaName")
+            sb.appendLine("§7Chunks in index: §f${cachedChunksToDisk.size}")
+            sb.appendLine("§7Chunks in memory: §f${loadedChunksInMemory.size}")
+            sb.appendLine("§7Cache directory: §f${cacheDirectory.absolutePath}")
+            
+            val areaDir = File(cacheDirectory, currentAreaName)
+            if (areaDir.exists()) {
+                val files = areaDir.listFiles()?.filter { it.name.endsWith(".json") } ?: emptyList()
+                sb.appendLine("§7Chunk files in area folder: §f${files.size}")
+                if (files.isNotEmpty()) {
+                    val sample = files.take(5).map { it.name }
+                    sb.appendLine("§7Sample files: §f$sample")
+                }
+            } else {
+                sb.appendLine("§cArea folder doesn't exist: ${areaDir.absolutePath}")
+            }
+            
+            return sb.toString()
+        }
+        
+        /**
+         * Debug: Force load all chunks from the area folder into memory
+         */
+        fun debugLoadAllChunks(world: net.minecraft.world.World): Pair<Int, Int> {
+            val areaName = getAreaNameFromTablist()
+            if (areaName != "unknown") {
+                currentAreaName = areaName
+            }
+            
+            val areaDir = File(cacheDirectory, currentAreaName)
+            if (!areaDir.exists()) {
+                println("[WorldSnapshot] Area folder doesn't exist: ${areaDir.absolutePath}")
+                return Pair(0, 0)
+            }
+            
+            val files = areaDir.listFiles()?.filter { it.name.startsWith("chunk_") && it.name.endsWith(".json") } ?: emptyList()
+            println("[WorldSnapshot] Found ${files.size} chunk files in $currentAreaName")
+            
+            var loadedChunks = 0
+            var loadedBlocks = 0
+            
+            // Load directly into the shared cache so pathfinding can use it
+            sharedBlockCache.clear()
+            
+            for (file in files) {
+                try {
+                    // Parse chunk coords from filename: chunk_X_Z.json
+                    val parts = file.nameWithoutExtension.split("_")
+                    if (parts.size >= 3) {
+                        val chunkX = parts[1].toInt()
+                        val chunkZ = parts[2].toInt()
+                        
+                        val loaded = loadChunkFromDisk(chunkX, chunkZ, sharedBlockCache)
+                        if (loaded > 0) {
+                            loadedChunks++
+                            loadedBlocks += loaded
+                            cachedChunksToDisk.add(Pair(chunkX, chunkZ))
+                            loadedChunksInMemory.add(Pair(chunkX, chunkZ))
+                        }
+                    }
+                } catch (e: Exception) {
+                    println("[WorldSnapshot] Error loading ${file.name}: ${e.message}")
+                }
+            }
+            
+            // Update the shared snapshot if one exists
+            saveCachedChunksIndex()
+            
+            println("[WorldSnapshot] Debug load complete: $loadedChunks chunks, $loadedBlocks blocks")
+            return Pair(loadedChunks, loadedBlocks)
+        }
+        
+        /**
+         * Loads a chunk from disk into the given cache map.
+         * @return Number of blocks loaded
+         */
+        private fun loadChunkFromDisk(chunkX: Int, chunkZ: Int, cache: MutableMap<BlockPos, net.minecraft.block.BlockState>): Int {
+            val chunkFile = getChunkCacheFile(chunkX, chunkZ)
+            if (!chunkFile.exists()) return 0
+            
+            try {
+                val jsonText = chunkFile.readText()
+                val json = gson.fromJson(jsonText, JsonObject::class.java)
+                val blocksArray = json.getAsJsonArray("blocks")
+                var loaded = 0
+                
+                for (element in blocksArray) {
+                    val obj = element.asJsonObject
+                    val x = obj.get("x").asInt
+                    val y = obj.get("y").asInt
+                    val z = obj.get("z").asInt
+                    val blockId = obj.get("block").asString
+                    
+                    val pos = BlockPos(x, y, z)
+                    val block = net.minecraft.registry.Registries.BLOCK.get(
+                        net.minecraft.util.Identifier.of(blockId)
+                    )
+                    cache[pos] = block.defaultState
+                    loaded++
+                }
+                
+                return loaded
+            } catch (e: Exception) {
+                println("[WorldSnapshot] Failed to load chunk ($chunkX, $chunkZ) from disk: ${e.message}")
+                return 0
+            }
+        }
+        
+        /**
+         * Loads a chunk from the live world into the cache map.
+         * @return Number of blocks loaded
+         */
+        private fun loadChunkFromWorld(world: net.minecraft.world.World, chunkX: Int, chunkZ: Int, cache: MutableMap<BlockPos, net.minecraft.block.BlockState>): Int {
+            val startX = chunkX shl 4
+            val startZ = chunkZ shl 4
+            var loaded = 0
+            
+            try {
+                for (x in startX until startX + 16) {
+                    for (z in startZ until startZ + 16) {
+                        for (y in world.bottomY until (world.bottomY + world.height)) {
+                            val pos = BlockPos(x, y, z)
+                            val state = world.getBlockState(pos)
+                            cache[pos] = state
+                            loaded++
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                // Chunk might not be loaded
+            }
+            
+            return loaded
+        }
+        
+        /**
+         * Creates a snapshot by loading saved chunks from disk.
+         */
+        fun loadFromDisk(world: net.minecraft.world.World): WorldSnapshot? {
+            // Update area name
+            val areaName = getAreaNameFromTablist()
+            if (areaName != "unknown") {
+                currentAreaName = areaName
+            }
+            
+            if (cachedChunksToDisk.isEmpty()) {
+                println("[WorldSnapshot] No cached chunks found for $currentAreaName")
+                return null
+            }
+            
+            // Create empty cache - chunks will be loaded on demand via create()
+            val blockCache = Collections.synchronizedMap(mutableMapOf<BlockPos, net.minecraft.block.BlockState>())
+            
+            println("[WorldSnapshot] Ready to load from ${cachedChunksToDisk.size} cached chunks on disk")
+            return WorldSnapshot(world, blockCache)
+        }
+        
+        /**
+         * Clears the in-memory cache to free memory.
+         * Disk cache remains intact.
+         */
+        fun clearMemoryCache() {
+            loadedChunksInMemory.clear()
+            println("[WorldSnapshot] Cleared in-memory cache. Disk cache still has ${cachedChunksToDisk.size} chunks")
         }
     }
     
     /**
-     * Gets cached block state. Returns AIR if not in cache.
+     * Gets block state from in-memory cache.
+     * Returns AIR if not in cache (fast path for pathfinding).
      */
     fun getBlockState(pos: BlockPos): net.minecraft.block.BlockState {
         return blockCache[pos] ?: Blocks.AIR.defaultState

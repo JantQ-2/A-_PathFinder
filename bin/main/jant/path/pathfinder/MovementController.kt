@@ -318,10 +318,11 @@ object MovementController {
         mc.options.jumpKey.setPressed(false)
         jumpticks = 1
     }
-
+    /*
     fun rightClick() {
-        mc.options.usekey.setPressed(true)
+        mc.options.useKey.setPressed(true)
     }
+    */
 
     /**
      * Determines whether the player should jump to reach the target position.
