@@ -31,10 +31,10 @@ object PathfinderModule : Module(
 
   val rotationSpeed by SliderSetting(
     name = "Rotation Speed",
-    description = "How fast to rotate (degrees per tick)",
-    defaultValue = 15.0,
-    min = 1.0,
-    max = 45.0
+    description = "Speed multiplier for rotations (higher = faster)",
+    defaultValue = 1.0,
+    min = 0.1,
+    max = 5.0
   )
 
   /**

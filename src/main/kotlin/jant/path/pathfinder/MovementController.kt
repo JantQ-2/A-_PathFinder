@@ -5,6 +5,7 @@ import net.minecraft.client.MinecraftClient
 import net.minecraft.client.network.ClientPlayerEntity
 import net.minecraft.util.math.BlockPos
 import net.minecraft.util.math.Vec3d
+import org.cobalt.api.util.player.MovementManager
 import org.cobalt.internal.rotation.EasingType
 import kotlin.math.atan2
 import kotlin.math.sqrt
@@ -13,14 +14,14 @@ import kotlin.math.sqrt
  * Controls player movement and rotation for pathfinding.
  * 
  * This object handles:
- * - Smooth camera rotation toward targets with configurable easing
+ * - Smooth Bezier curve camera rotation toward targets
  * - Movement input simulation (W/A/S/D keys)
  * - Jump detection and execution
  * - Sprint control
  * 
  * CUSTOMIZATION TIPS:
  * - Adjust rotation speed via PathfinderModule.rotationSpeed
- * - Modify MIN_TIME_BETWEEN_SMALL_ROTATIONS to change rotation smoothness
+ * - Modify Bezier control points for different curve shapes
  * - Change angle thresholds in moveTowards() for different movement patterns
  * - Modify pitch calculation in updateRotation() for custom look angles
  */
@@ -31,28 +32,55 @@ object MovementController {
     
     private val mc = MinecraftClient.getInstance()
     private var targetYaw: Float? = null  // Desired horizontal rotation
+    private var targetPitch: Float = 5.0f  // Desired vertical rotation
     private var lastFrameTime = System.nanoTime()  // For delta time calculation
-    private var lastSmallRotationTime = System.nanoTime()  // Prevents jittery micro-rotations
+    private var rotationProgress: Float = 1.0f  // 0.0 to 1.0, where 1.0 = at target
+    private var startYaw: Float = 0f
+    private var startPitch: Float = 0f
     
-    // Minimum time (seconds) between small rotations to prevent jitter
-    private const val MIN_TIME_BETWEEN_SMALL_ROTATIONS = 0.16
+    /**
+     * Cubic Bezier interpolation function.
+     * Creates smooth, natural-looking curves between start and end points.
+     */
+    private fun cubicBezier(t: Float, p0: Float, p1: Float, p2: Float, p3: Float): Float {
+        val u = 1f - t
+        val tt = t * t
+        val uu = u * u
+        val uuu = uu * u
+        val ttt = tt * t
+        
+        return uuu * p0 + 3 * uu * t * p1 + 3 * u * tt * p2 + ttt * p3
+    }
+    
+    /**
+     * Apply Bezier curve to rotation with control points for smooth motion.
+     */
+    private fun bezierEase(t: Float): Float {
+        // Control points for smooth acceleration and deceleration
+        // Adjust these for different curve shapes:
+        // (0.25, 0.1) = start control point (slow start)
+        // (0.75, 0.9) = end control point (slow end)
+        return cubicBezier(t, 0f, 0.25f, 0.75f, 1f)
+    }
 
     /**
-     * Smoothly rotates the player's camera toward a target position.
+     * Smoothly rotates the player's camera toward a target position using Bezier curves.
      * 
      * This function calculates the required yaw (horizontal) and pitch (vertical) rotations,
-     * then applies them gradually using configurable easing for natural movement.
+     * then applies them gradually using Bezier interpolation for very smooth, natural movement.
+     * Also locks player's look control during pathfinding.
      * 
      * @param player The player entity to rotate
      * @param target The 3D position to look at
      * 
      * CUSTOMIZATION:
      * - Change basePitch value to adjust default looking angle
-     * - Modify pitch coercion ranges to allow more/less vertical look
-     * - Adjust rotationSpeed multiplier (currently 0.7f) for different speeds
-     * - Change small rotation threshold (currently 5.0f) to affect smoothness
+     * - Modify Bezier control points in bezierEase() for different curve shapes
+     * - Adjust rotationSpeed for different speeds
      */
     fun updateRotation(player: ClientPlayerEntity, target: Vec3d) {
+        // Lock player's look control during automated rotation
+        MovementManager.setLookLock(true)
         // Calculate player's eye position (where the camera is)
         val playerPos = Vec3d(player.x, player.y + player.getEyeHeight(player.pose), player.z)
         val direction = target.subtract(playerPos)
@@ -86,67 +114,99 @@ object MovementController {
             calculatedPitch.coerceIn(basePitch - 5f, basePitch + 5f)
         }
 
-        targetYaw = newTargetYaw
+        // Check if we have a new target
+        var targetDiffYaw = newTargetYaw - (targetYaw ?: newTargetYaw)
+        while (targetDiffYaw > 180) targetDiffYaw -= 360
+        while (targetDiffYaw < -180) targetDiffYaw += 360
+        
+        val targetDiffPitch = kotlin.math.abs(newTargetPitch - targetPitch)
+        val hasNewTarget = kotlin.math.abs(targetDiffYaw) > 1.0f || targetDiffPitch > 0.5f
+        
+        if (hasNewTarget) {
+            // Start new rotation
+            startYaw = player.yaw
+            startPitch = player.pitch
+            targetYaw = newTargetYaw
+            targetPitch = newTargetPitch
+            rotationProgress = 0.0f
+        }
+
+        // If we're already at target, nothing to do
+        if (rotationProgress >= 1.0f) {
+            return
+        }
 
         // Calculate time since last frame for smooth, frame-rate independent rotation
         val frameTime = System.nanoTime()
         val deltaTime = ((frameTime - lastFrameTime) / 1_000_000_000.0).coerceIn(0.0, 0.1)
         lastFrameTime = frameTime
 
-        // Get rotation speed from module settings and apply scaling factor
-        val rotationSpeed = PathfinderModule.rotationSpeed.toFloat() * 0.7f
-        val easingType = PathfinderModule.getEasingType()
-
-        val currentYaw = player.yaw
-        var yawDiff = newTargetYaw - currentYaw
-
-        // Normalize angle difference to [-180, 180] range (shortest rotation path)
-        while (yawDiff > 180) yawDiff -= 360
-        while (yawDiff < -180) yawDiff += 360
-
-        val degreesPerSecond = rotationSpeed * 20.0f
-        val maxRotationThisFrame = degreesPerSecond * deltaTime.toFloat()
-
-        val absYawDiff = kotlin.math.abs(yawDiff)
-
-        val isSmallRotation = absYawDiff < 5.0f
-        val currentTime = System.nanoTime()
-        val timeSinceLastSmallRotation = (currentTime - lastSmallRotationTime) / 1_000_000_000.0
-
-        if (isSmallRotation && timeSinceLastSmallRotation < MIN_TIME_BETWEEN_SMALL_ROTATIONS) {
-
-            return
-        }
-
-        if (absYawDiff > 0.1f) {
-            if (isSmallRotation) {
-                lastSmallRotationTime = currentTime
-            }
-
-            val rotationAmount = if (absYawDiff <= maxRotationThisFrame) {
-                val progress = (maxRotationThisFrame / absYawDiff).coerceIn(0f, 1f)
-                val easedProgress = easingType.ease(progress)
-                yawDiff * easedProgress
+        // Get rotation speed multiplier from module settings
+        val speedMultiplier = PathfinderModule.rotationSpeed.toFloat()
+        
+        // Calculate total rotation needed
+        val yawDiff = targetYaw?.let { target ->
+            var diff = target - startYaw
+            while (diff > 180) diff -= 360
+            while (diff < -180) diff += 360
+            diff
+        } ?: 0f
+        
+        val pitchDiff = targetPitch - startPitch
+        val totalRotation = kotlin.math.sqrt(yawDiff * yawDiff + pitchDiff * pitchDiff)
+        
+        // Dynamic rotation speed: larger rotations are faster
+        // Small rotations (< 40°): use base speed
+        // Large rotations (> 40°): scale up speed progressively
+        val baseRotationTime = 0.5f  // seconds for 90 degrees
+        val minRotationTime = 0.15f / speedMultiplier  // minimum time for any rotation
+        
+        val timeToComplete = if (totalRotation > 0) {
+            // Apply speed boost for rotations larger than 40 degrees
+            val speedBoost = if (totalRotation > 40.0f) {
+                // Scale from 1.0x at 40° to 3.0x at 180°
+                1.0f + ((totalRotation - 40.0f) / 140.0f) * 2.0f
             } else {
-                if (yawDiff > 0) maxRotationThisFrame else -maxRotationThisFrame
+                1.0f
             }
-            player.yaw = currentYaw + rotationAmount
+            
+            val calculatedTime = (totalRotation / 90.0f) * baseRotationTime / (speedMultiplier * speedBoost)
+            calculatedTime.coerceAtLeast(minRotationTime)
+        } else {
+            0.016f  // one frame
         }
-
-        val currentPitch = player.pitch
-        var pitchDiff = newTargetPitch - currentPitch
-        val absPitchDiff = kotlin.math.abs(pitchDiff)
-
-        if (absPitchDiff > 0.5f) {
-            val pitchRotationAmount = if (absPitchDiff <= maxRotationThisFrame * 0.5f) {
-                val progress = ((maxRotationThisFrame * 0.5f) / absPitchDiff).coerceIn(0f, 1f)
-                val easedProgress = easingType.ease(progress)
-                pitchDiff * easedProgress
-            } else {
-                if (pitchDiff > 0) maxRotationThisFrame * 0.5f else -maxRotationThisFrame * 0.5f
-            }
-            player.pitch = (currentPitch + pitchRotationAmount).coerceIn(-90f, 90f)
+        
+        // Calculate progress increment for this frame
+        val progressIncrement = if (timeToComplete > 0) {
+            (deltaTime.toFloat() / timeToComplete).coerceAtMost(1.0f)
+        } else {
+            1.0f
         }
+        
+        // Advance progress based on rotation speed
+        rotationProgress = (rotationProgress + progressIncrement).coerceIn(0f, 1f)
+        
+        // Apply Bezier easing to progress
+        val easedProgress = bezierEase(rotationProgress)
+        
+        // Calculate yaw with proper angle wrapping
+        targetYaw?.let { target ->
+            val interpolatedYaw = startYaw + (yawDiff * easedProgress)
+            player.yaw = interpolatedYaw
+        }
+        
+        // Calculate pitch
+        val interpolatedPitch = startPitch + (pitchDiff * easedProgress)
+        player.pitch = interpolatedPitch.coerceIn(-90f, 90f)
+    }
+    
+    /**
+     * Stops rotation and releases look lock.
+     * Call this when pathfinding ends to restore player control.
+     */
+    fun stopRotation() {
+        MovementManager.setLookLock(false)
+        rotationProgress = 1.0f
     }
 
     /**
@@ -259,6 +319,10 @@ object MovementController {
         jumpticks = 1
     }
 
+    fun rightClick() {
+        mc.options.usekey.setPressed(true)
+    }
+
     /**
      * Determines whether the player should jump to reach the target position.
      * 
@@ -345,8 +409,10 @@ object MovementController {
 
         val effectiveHeightDiff = if (heightDiff == 1 && targetHasSlabBelow) 0.3 else heightDiff.toDouble()
         val targetIsHigher = effectiveHeightDiff > 0.5
-
-        return hasObstacle || gapDetected || targetIsHigher
+        
+        // Only jump for obstacles or when target is higher
+        // Don't jump for gaps (drops) - let player walk off naturally
+        return (hasObstacle || targetIsHigher) && !gapDetected
     }
 
     /**

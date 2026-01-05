@@ -6,6 +6,8 @@ import jant.path.api.PathfinderSession
 import net.minecraft.block.Blocks
 import net.minecraft.client.MinecraftClient
 import net.minecraft.client.network.ClientPlayerEntity
+import net.minecraft.item.ItemStack
+import net.minecraft.nbt.NbtCompound
 import net.minecraft.registry.tag.BlockTags
 import net.minecraft.util.math.BlockPos
 import net.minecraft.util.math.Box
@@ -13,6 +15,7 @@ import net.minecraft.util.math.Vec3d
 import org.cobalt.api.event.impl.render.WorldRenderContext
 import org.cobalt.api.pathfinder.IPathExec
 import org.cobalt.api.util.render.Render3D
+import org.cobalt.api.util.PlayerUtils.position
 import java.awt.Color
 import java.util.*
 import java.util.Collections
@@ -34,7 +37,7 @@ object PathfinderCore : IPathExec {
     private const val VERTICAL_CLIMB_COST = 2.5
     private const val VERTICAL_DROP_COST = 0.8
     
-    private const val HEURISTIC_BIAS = 1.5  // Higher bias = faster but less optimal paths
+    private const val HEURISTIC_BIAS = 2  // Higher bias = faster but less optimal paths
 
     private const val DEBUG = true
     
@@ -92,6 +95,74 @@ object PathfinderCore : IPathExec {
         PathfinderAPIInternal.stopPathfinding = {
             currentApiSession = null
             clearPath()
+        }
+    }
+
+    /**
+     * Checks if an ItemStack is an Aspect of the Void or Aspect of the End.
+     * Searches for the item ID in NBT data.
+     */
+    private fun isAspectItem(stack: ItemStack): Boolean {
+        if (stack.isEmpty) return false
+        
+        try {
+            // In Minecraft 1.21, custom NBT is stored in the DataComponentTypes.CUSTOM_DATA component
+            val customDataType = net.minecraft.component.DataComponentTypes.CUSTOM_DATA
+            val customData = stack.get(customDataType) ?: return false
+            
+            // Get the NBT compound from custom data using copyNbt()
+            val nbt: NbtCompound = customData.copyNbt()
+            
+            // Check for ExtraAttributes.id field (Hypixel SkyBlock format)
+            val extraAttrs = nbt.getCompound("ExtraAttributes")
+            if (extraAttrs.isPresent) {
+                val attrs = extraAttrs.get()
+                val itemIdOpt = attrs.getString("id")
+                if (itemIdOpt.isPresent) {
+                    val itemId = itemIdOpt.get()
+                    return itemId == "ASPECT_OF_THE_VOID" || itemId == "ASPECT_OF_THE_END"
+                }
+            }
+            
+            // Fallback: check direct id field
+            val itemIdOpt = nbt.getString("id")
+            if (itemIdOpt.isPresent) {
+                val itemId = itemIdOpt.get()
+                return itemId == "ASPECT_OF_THE_VOID" || itemId == "ASPECT_OF_THE_END"
+            }
+        } catch (e: Exception) {
+            if (DEBUG) println("[Pathfinder] Error checking item NBT: ${e.message}")
+        }
+        
+        return false
+    }
+    
+    /**
+     * Finds the hotbar slot containing an Aspect item.
+     * Returns the slot index (0-8) or -1 if not found.
+     */
+    private fun findAspectItemSlot(player: ClientPlayerEntity): Int {
+        val inventory = player.inventory
+        
+        // Check hotbar slots (0-8)
+        for (slot in 0..8) {
+            val stack = inventory.getStack(slot)
+            if (isAspectItem(stack)) {
+                return slot
+            }
+        }
+        
+        return -1
+    }
+    
+    /**
+     * Holds the Aspect item if available in hotbar.
+     */
+    private fun holdAspectItem(player: ClientPlayerEntity) {
+        val aspectSlot = findAspectItemSlot(player)
+        if (aspectSlot != -1 && player.inventory.selectedSlot != aspectSlot) {
+            player.inventory.selectedSlot = aspectSlot
+            if (DEBUG) println("[Pathfinder] Switched to Aspect item in slot $aspectSlot")
         }
     }
 
@@ -168,6 +239,9 @@ object PathfinderCore : IPathExec {
         mc.options.sneakKey.setPressed(false)
         shouldKeepSneak = false
         currentApiSession = null
+        
+        // Release look lock
+        MovementController.stopRotation()
     }
 
     /**
@@ -201,6 +275,10 @@ object PathfinderCore : IPathExec {
      */
     override fun onTick(player: ClientPlayerEntity) {
         val target = targetPos ?: return
+        
+        // Hold Aspect item if available
+        holdAspectItem(player)
+        
         val currentTime = System.currentTimeMillis()
         val playerPos = BlockPos.ofFloored(player.x, player.y, player.z)
 
@@ -652,8 +730,11 @@ object PathfinderCore : IPathExec {
      * - 2-3 walls: 0.3 (slightly enclosed)
      * - 0-1 walls: 0.0 (open space)
      * 
+     * Also adds extra penalty for "squeeze" situations where blocks are
+     * on opposite sides (hole/gap walking).
+     * 
      * @param pos Position to check
-     * @return Cost penalty (0.0 to 2.0)
+     * @return Cost penalty (0.0 to 5.0)
      */
     private fun checkWallProximity(pos: BlockPos): Double {
         val world = mc.world ?: return 0.0
@@ -672,13 +753,34 @@ object PathfinderCore : IPathExec {
                 wallCount++
             }
         }
+        
+        // Check for "squeeze" situations - blocks on opposite sides
+        var squeezePenalty = 0.0
+        
+        // Check X-axis squeeze (left and right walls)
+        val leftWall = world.getBlockState(pos.add(-1, 0, 0))
+        val rightWall = world.getBlockState(pos.add(1, 0, 0))
+        if (leftWall.isSolidBlock(world, pos.add(-1, 0, 0)) && 
+            rightWall.isSolidBlock(world, pos.add(1, 0, 0))) {
+            squeezePenalty += 3.0  // Heavy penalty for X-axis squeeze
+        }
+        
+        // Check Z-axis squeeze (front and back walls)
+        val frontWall = world.getBlockState(pos.add(0, 0, 1))
+        val backWall = world.getBlockState(pos.add(0, 0, -1))
+        if (frontWall.isSolidBlock(world, pos.add(0, 0, 1)) && 
+            backWall.isSolidBlock(world, pos.add(0, 0, -1))) {
+            squeezePenalty += 3.0  // Heavy penalty for Z-axis squeeze
+        }
 
-        return when {
+        val basePenalty = when {
             wallCount >= 6 -> 2.0 
             wallCount >= 4 -> 1.0 
             wallCount >= 2 -> 0.3 
             else -> 0.0 
         }
+        
+        return basePenalty + squeezePenalty
     }
 
     /**
@@ -1418,7 +1520,7 @@ object PathfinderCore : IPathExec {
      * Simplified for speed.
      */
     private fun checkWallProximityThreaded(pos: BlockPos, snapshot: WorldSnapshot): Double {
-        // Simplified - only check horizontal directions for speed
+        // Check horizontal directions
         var wallCount = 0
         val checkPositions = listOf(
             pos.add(1, 0, 0), pos.add(-1, 0, 0),
@@ -1431,13 +1533,34 @@ object PathfinderCore : IPathExec {
                 wallCount++
             }
         }
+        
+        // Check for "squeeze" situations - blocks on opposite sides
+        var squeezePenalty = 0.0
+        
+        // Check X-axis squeeze (left and right walls)
+        val leftWall = snapshot.getBlockState(pos.add(-1, 0, 0))
+        val rightWall = snapshot.getBlockState(pos.add(1, 0, 0))
+        if (leftWall.isSolidBlock(snapshot.world, pos.add(-1, 0, 0)) && 
+            rightWall.isSolidBlock(snapshot.world, pos.add(1, 0, 0))) {
+            squeezePenalty += 3.0  // Heavy penalty for X-axis squeeze
+        }
+        
+        // Check Z-axis squeeze (front and back walls)
+        val frontWall = snapshot.getBlockState(pos.add(0, 0, 1))
+        val backWall = snapshot.getBlockState(pos.add(0, 0, -1))
+        if (frontWall.isSolidBlock(snapshot.world, pos.add(0, 0, 1)) && 
+            backWall.isSolidBlock(snapshot.world, pos.add(0, 0, -1))) {
+            squeezePenalty += 3.0  // Heavy penalty for Z-axis squeeze
+        }
 
-        return when {
+        val basePenalty = when {
             wallCount >= 6 -> 2.0 
             wallCount >= 4 -> 1.0 
             wallCount >= 2 -> 0.3 
             else -> 0.0 
         }
+        
+        return basePenalty + squeezePenalty
     }
     
     /**
