@@ -47,19 +47,14 @@ object PathCommand : Command(
     
     @SubCommand
     fun info() {
-        val info = PathfinderCore.getDebugInfo()
-        info.lines().forEach { line ->
-            if (line.isNotBlank()) ChatUtils.sendMessage(line)
-        }
+        // Debug info removed - disk caching no longer used
+        ChatUtils.sendMessage("§7Debug info not available (disk caching removed)")
     }
     
     @SubCommand
     fun load() {
-        ChatUtils.sendMessage("§7Loading all chunks from disk...")
-        Thread {
-            val (chunks, blocks) = PathfinderCore.debugLoadAllChunks()
-            ChatUtils.sendMessage("§aLoaded §f$chunks §achunks with §f$blocks §ablocks into memory")
-        }.apply { isDaemon = true }.start()
+        // Load function removed - disk caching no longer used
+        ChatUtils.sendMessage("§7Load function not available (disk caching removed)")
     }
 }
 
